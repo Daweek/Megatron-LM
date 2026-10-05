@@ -26,7 +26,8 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
+from .context import FsdpContext
+from .module import FsdpModule
 from .schedule import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
