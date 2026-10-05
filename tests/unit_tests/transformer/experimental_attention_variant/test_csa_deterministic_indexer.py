@@ -67,6 +67,10 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
     # The torch flag selects index_add_ (on) or the stable sort + prefix sums (off).
     # Tiny test heads otherwise allocate a large unused padding-id array under the 1 GiB budget.
     monkeypatch.setattr(dk, "_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES", 4096)
+    # NGC PyTorch containers allow TF32 for cuBLAS by default, and whether cuBLAS then runs these
+    # tiny FP32 GEMMs on TF32 tensor cores depends on the GPU. A TF32 GEMM in the kernel or in the
+    # reference alone moves results by ~1e-3, so pin IEEE FP32 for the FP32 tolerance below.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     if chunk_rows is not None:
         monkeypatch.setattr(dk, "_deterministic_indexer_dk_chunk_rows", lambda *_: chunk_rows)
     device = torch.device("cuda", torch.cuda.current_device())
