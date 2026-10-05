@@ -182,7 +182,10 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant):
     def run(t):
         return fn(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
 
-    assert_replays_bit_exact(run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]")
+    outputs, _ = assert_replays_bit_exact(
+        run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]"
+    )
+    assert torch.isfinite(outputs["out"]).all()
 
 
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
