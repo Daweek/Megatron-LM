@@ -37,8 +37,8 @@ class FsdpContext:
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder["FsdpModule"]
-    backward_order: IndexedOrder["FsdpModule"]
+    forward_order: IndexedOrder[FsdpModule]
+    backward_order: IndexedOrder[FsdpModule]
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
@@ -80,7 +80,7 @@ class FsdpContext:
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
 
-    def register_module(self, module: "FsdpModule") -> None:
+    def register_module(self, module: FsdpModule) -> None:
         """Register a module constructed in this context."""
         if self._is_finalized:
             raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
@@ -147,7 +147,7 @@ class FsdpContext:
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
 
-def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
+def _collect_backward_order(module: nn.Module, order: IndexedOrder[FsdpModule]) -> None:
     """Collect one root's static backward prefetch order."""
     if isinstance(module, FsdpModule):
         order.append(module)
@@ -156,7 +156,7 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
         _collect_backward_order(child, order)
 
 
-def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> None:
+def _collect_fsdp_children(module: nn.Module, children: set[FsdpModule]) -> None:
     """Collect the nearest FSDP descendants of ``module``."""
     for child in module.children():
         if isinstance(child, FsdpModule):
