@@ -14,6 +14,8 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+from weakref import WeakKeyDictionary, WeakSet
+
 import torch
 from torch import nn
 
@@ -67,6 +69,10 @@ class FsdpContext:
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
+        # Topology metadata must not keep modules alive after construction.
+        self._roots: WeakSet[nn.Module] = WeakSet()
+        # Names are relative to each FSDP root and absent until finalization.
+        self._module_names: WeakKeyDictionary[nn.Module, str] = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self.allgather_stream = torch.cuda.Stream(device)
@@ -98,12 +104,12 @@ class FsdpContext:
         # FsdpModules that are not descendants of any other FsdpModule.
         roots = [module for module in self._registered_modules if module not in children]
 
+        self._roots.update(roots)
         for root in roots:
-            root._is_root = True
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
-                module._name = name
+                self._module_names[module] = name
                 self.forward_order.append(module)
 
         for root in reversed(roots):
@@ -112,6 +118,17 @@ class FsdpContext:
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
+
+    def is_root(self, module: nn.Module) -> bool:
+        """Return whether ``module`` is an outermost FSDP module in this context."""
+        return module in self._roots
+
+    def module_name(self, module: nn.Module) -> str:
+        """Return ``module``'s name relative to its FSDP root."""
+        name = self._module_names.get(module)
+        if name is None:
+            raise RuntimeError("FSDP module name has not been initialized.")
+        return name
 
     def ensure_finalized(self) -> None:
         """Raise if construction has not completed for this context."""
