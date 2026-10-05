@@ -119,7 +119,7 @@ def fully_shard_context(
     except Exception:
         raise
     else:
-        context.finalize(FsdpModule)
+        context.finalize()
     finally:
         _FSDP_CONTEXT.reset(token)
 
