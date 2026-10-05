@@ -18,7 +18,7 @@
 # back to module.py, which imports this context.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -74,7 +74,7 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
-        # Construction-only; consumed and cleared when fully_shard_context exits.
+        # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -91,6 +91,37 @@ class FsdpContext:
         if self._is_finalized:
             raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
         self._registered_modules.append(module)
+
+    def finalize(self, module_type: type[FsdpModule]) -> None:
+        """Finalize roots, names, and cross-root prefetch orders.
+
+        Args:
+            module_type: FsdpModule, supplied by the construction entrypoint so
+                runtime type checks do not require a circular import.
+        """
+        if self._is_finalized:
+            raise RuntimeError("FSDP context is already finalized.")
+
+        children: set[FsdpModule] = set()
+        for module in self._registered_modules:
+            _collect_fsdp_children(cast(nn.Module, module), module_type, children)
+        # FsdpModules that are not descendants of any other FsdpModule.
+        roots = [module for module in self._registered_modules if module not in children]
+
+        for root in roots:
+            root._is_root = True
+            for name, module in cast(nn.Module, root).named_modules():
+                if not isinstance(module, module_type):
+                    continue
+                module._name = name
+                self.forward_order.append(module)
+
+        for root in reversed(roots):
+            _collect_backward_order(cast(nn.Module, root), module_type, self.backward_order)
+
+        self._registered_modules.clear()
+        self.parameter_to_owner = None
+        self._is_finalized = True
 
     def ensure_finalized(self) -> None:
         """Raise if construction has not completed for this context."""
@@ -125,3 +156,25 @@ class FsdpContext:
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+
+
+def _collect_backward_order(
+    module: nn.Module, module_type: type[FsdpModule], order: IndexedOrder[FsdpModule]
+) -> None:
+    """Collect one root's static backward prefetch order."""
+    if isinstance(module, module_type):
+        order.append(module)
+
+    for child in reversed(list(module.children())):
+        _collect_backward_order(child, module_type, order)
+
+
+def _collect_fsdp_children(
+    module: nn.Module, module_type: type[FsdpModule], children: set[FsdpModule]
+) -> None:
+    """Collect the nearest FSDP descendants of ``module``."""
+    for child in module.children():
+        if isinstance(child, module_type):
+            children.add(child)
+        else:
+            _collect_fsdp_children(child, module_type, children)

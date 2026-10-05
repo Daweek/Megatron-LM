@@ -19,7 +19,6 @@ import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import cast
 
 import torch
 from torch import nn
@@ -28,7 +27,6 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
-from .indexed_order import IndexedOrder
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -121,7 +119,7 @@ def fully_shard_context(
     except Exception:
         raise
     else:
-        _finalize_context(context)
+        context.finalize(FsdpModule)
     finally:
         _FSDP_CONTEXT.reset(token)
 
@@ -259,48 +257,3 @@ def _attach_mixin(module: nn.Module) -> None:
 def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
     """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
     return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-
-
-def _finalize_context(context: FsdpContext) -> None:
-    """Finalize roots, names, and cross-root prefetch orders after construction."""
-    if context._is_finalized:
-        raise RuntimeError("FSDP context is already finalized.")
-
-    children: set[FsdpModule] = set()
-    for module in context._registered_modules:
-        _collect_fsdp_children(cast(nn.Module, module), children)
-    # FsdpModules that are not descendants of any other FsdpModule.
-    roots = [module for module in context._registered_modules if module not in children]
-
-    for root in roots:
-        root._is_root = True
-        for name, module in cast(nn.Module, root).named_modules():
-            if not isinstance(module, FsdpModule):
-                continue
-            module._name = name
-            context.forward_order.append(module)
-
-    for root in reversed(roots):
-        _collect_backward_order(cast(nn.Module, root), context.backward_order)
-
-    context._registered_modules.clear()
-    context.parameter_to_owner = None
-    context._is_finalized = True
-
-
-def _collect_backward_order(module: nn.Module, order: IndexedOrder[FsdpModule]) -> None:
-    """Collect one root's static backward prefetch order."""
-    if isinstance(module, FsdpModule):
-        order.append(module)
-
-    for child in reversed(list(module.children())):
-        _collect_backward_order(child, order)
-
-
-def _collect_fsdp_children(module: nn.Module, children: set[FsdpModule]) -> None:
-    """Collect the nearest FSDP descendants of ``module``."""
-    for child in module.children():
-        if isinstance(child, FsdpModule):
-            children.add(child)
-        else:
-            _collect_fsdp_children(child, children)
