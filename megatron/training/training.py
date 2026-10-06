@@ -3343,6 +3343,9 @@ def train(
              torch.distributed.get_rank() in args.profile_ranks)
         and args.use_pytorch_profiler
     ):
+        # print("\n\n\n\n\n\n\n\n")
+        # print("READY to Profile using Pytorch")
+        # print("\n\n\n\n\n\n\n\n")
         if args.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
@@ -3350,7 +3353,10 @@ def train(
         else:
             et = None
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            # print("\n\n\n\n\n\n\n\n")
+            # print("READY to PROFILERRRR")
+            # print("\n\n\n\n\n\n\n\n")
+            profile_dir = Path(f"{args.tensorboard_dir}/../profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(

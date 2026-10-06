@@ -25,3 +25,10 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+
+dataset/
+checkpoints/
+tensorboard/
+chakra/
+profile/
+

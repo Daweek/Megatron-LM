@@ -406,3 +406,5 @@ if __name__ == "__main__":
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
+
+    torch.distributed.destroy_process_group()
