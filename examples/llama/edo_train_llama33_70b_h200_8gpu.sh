@@ -1,4 +1,7 @@
 #!/bin/bash
+# Run from the repository root in your active Megatron environment:
+#   bash examples/llama/edo_train_llama33_70b_h200_8gpu.sh
+# Synthetic data: MOCK_DATA=1 bash examples/llama/edo_train_llama33_70b_h200_8gpu.sh
 
 python --version
 python -c "import torch; print(torch.__version__)"
@@ -33,15 +36,13 @@ rm -rf chakra/*
 set -euo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# 1. PBS allocates one full H200 node. One torchrun agent launches eight GPU
+# 1. Run on one node with eight visible H200 GPUs. One torchrun agent launches eight GPU
 # processes. --standalone chooses a local rendezvous endpoint automatically.
-: "${PBS_NODEFILE:?Submit with qsub; PBS_NODEFILE must describe the allocation}"
-[[ -r "$PBS_NODEFILE" ]] || die "Cannot read PBS_NODEFILE=$PBS_NODEFILE"
-REPO_DIR=${REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}
+REPO_DIR=${REPO_DIR:-$PWD}
 cd "$REPO_DIR"
 REPO_DIR=$PWD
-[[ -f pretrain_gpt.py ]] || die "Submit from the Megatron-LM repository root"
-NUM_NODES=$(awk '!seen[$0]++ {n++} END {print n+0}' "$PBS_NODEFILE")
+[[ -f pretrain_gpt.py ]] || die "Run from the Megatron-LM repository root"
+NUM_NODES=1
 GPUS_PER_NODE=8
 WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
@@ -54,7 +55,6 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 # CPU optimizer offload creates memory headroom for full training.
 TP=8
 PP=1
-(( NUM_NODES == 1 )) || die "This launcher requires exactly one full node (8 GPUs)"
 DP=$((WORLD_SIZE / (TP * PP)))
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
@@ -62,10 +62,9 @@ SEQ_LENGTH=${SEQ_LENGTH:-2048}
 TRAIN_ITERS=${TRAIN_ITERS:-100}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 SAVE_INTERVAL=${SAVE_INTERVAL:-100}
-EXIT_MINUTES=${EXIT_MINUTES:-110}
 MOCK_DATA=${MOCK_DATA:-0}
 DRY_RUN=${DRY_RUN:-0}
-for name in MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE SEQ_LENGTH TRAIN_ITERS SAVE_INTERVAL EXIT_MINUTES OMP_NUM_THREADS; do
+for name in MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE SEQ_LENGTH TRAIN_ITERS SAVE_INTERVAL OMP_NUM_THREADS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 done
 [[ "$WARMUP_ITERS" =~ ^(0|[1-9][0-9]*)$ ]] || die "WARMUP_ITERS must be a nonnegative integer"
@@ -77,7 +76,7 @@ NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DP)))
 
 # 3. Use persistent storage for datasets, logs, and the large checkpoints.
 # A new output directory prevents accidental reuse/overwriting of another run.
-RUN_DIR=${RUN_DIR:-$REPO_DIR/runs/llama33_70b_h200_8gpu/${PBS_JOBID:-manual-$(date +%Y%m%d-%H%M%S)}}
+RUN_DIR=${RUN_DIR:-$REPO_DIR/runs/llama33_70b_h200_8gpu/interactive-$(date +%Y%m%d-%H%M%S)-$}
 [[ "$RUN_DIR" = /* ]] || RUN_DIR="$REPO_DIR/$RUN_DIR"
 [[ ! -e "$RUN_DIR" ]] || die "RUN_DIR already exists; choose a fresh directory"
 RESUME_FROM=${RESUME_FROM:-}
@@ -163,6 +162,7 @@ TRAINING_ARGS=(
     --global-batch-size "$GLOBAL_BATCH_SIZE"
     --train-iters "$TRAIN_ITERS"
     --optimizer adam
+    --use-precision-aware-optimizer
     --optimizer-cpu-offload
     --optimizer-offload-fraction 1.0
     --overlap-cpu-optimizer-d2h-h2d
@@ -185,8 +185,8 @@ TRAINING_ARGS=(
     --save "$RUN_DIR/checkpoints"
     --tensorboard-dir "$RUN_DIR/tensorboard"
     --data-cache-path "$RUN_DIR/data-cache"
-    --exit-duration-in-mins "$EXIT_MINUTES"
     --distributed-timeout-minutes 30
+    
 )
 
 echo "Nodes=$NUM_NODES GPUs=$WORLD_SIZE TP=$TP PP=$PP DP=$DP"
@@ -222,4 +222,3 @@ mkdir -p "$RUN_DIR"
 printf '%q ' "${COMMAND[@]}" > "$RUN_DIR/command.sh"
 printf '\n' >> "$RUN_DIR/command.sh"
 "${COMMAND[@]}" 2>&1 | tee "$RUN_DIR/train.log"
-

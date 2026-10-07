@@ -10,7 +10,7 @@
 # Random-initialized Llama 3.3 70B architecture; this does not load Meta weights.
 # Tested against the flags on the Megatron-LM-Edgar-abci branch.
 # Submit from the repository root after activating your working Megatron Python
-# environment and loading ABCI's HPC-X module (module load hpcx/2.20).
+# environment. PBS starts one torch.distributed.run agent on each node.
 # Real data: export TOKENIZER_MODEL=/shared/llama33-tokenizer
 #            export DATA_PATH=/shared/llama33_arxiv_text_document
 #            qsub examples/llama/edo_train_llama33_70b_h200.sh
@@ -20,15 +20,17 @@
 set -euo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# 1. PBS allocates two full H200 nodes, each with eight GPUs. MPI launches ONE
+# 1. PBS allocates two full H200 nodes, each with eight GPUs. pbsdsh launches ONE
 # torchrun agent per node; that agent launches eight GPU training processes.
 : "${PBS_NODEFILE:?Submit with qsub; PBS_NODEFILE must describe the allocation}"
 [[ -r "$PBS_NODEFILE" ]] || die "Cannot read PBS_NODEFILE=$PBS_NODEFILE"
 REPO_DIR=${REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}
 cd "$REPO_DIR"
 REPO_DIR=$PWD
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 [[ -f pretrain_gpt.py ]] || die "Submit from the Megatron-LM repository root"
 NUM_NODES=$(awk '!seen[$0]++ {n++} END {print n+0}' "$PBS_NODEFILE")
+[[ $(awk 'END {print NR}' "$PBS_NODEFILE") -eq "$NUM_NODES" ]] || die "Use mpiprocs=1: one PBS_NODEFILE entry per node is required"
 GPUS_PER_NODE=8
 WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
 MASTER_ADDR=${MASTER_ADDR:-$(awk 'NR == 1 {print; exit}' "$PBS_NODEFILE")}
@@ -84,17 +86,20 @@ DATA_ARGS=(--split 949,50,1 --num-workers 4 --no-create-attention-mask-in-datalo
 if [[ "$MOCK_DATA" == 1 ]]; then
     DATA_ARGS+=(--mock-data --tokenizer-type NullTokenizer --vocab-size 128256)
 else
-    : "${TOKENIZER_MODEL:?Set a shared local directory containing the Llama 3.3 HF tokenizer files}"
-    : "${DATA_PATH:?Set the Llama-tokenized Megatron dataset prefix, without .bin or .idx}"
+    TOKENIZER_MODEL=${TOKENIZER_MODEL:-$REPO_DIR/dataset/llama33-tokenizer}
+    DATA_PATH=${DATA_PATH:-$REPO_DIR/dataset/arxiv_llama33_text_document}
     [[ "$TOKENIZER_MODEL" = /* ]] || TOKENIZER_MODEL="$REPO_DIR/$TOKENIZER_MODEL"
     [[ "$DATA_PATH" = /* ]] || DATA_PATH="$REPO_DIR/$DATA_PATH"
     [[ -d "$TOKENIZER_MODEL" ]] || die "Tokenizer directory does not exist"
+    for file in tokenizer.json tokenizer_config.json; do
+        [[ -s "$TOKENIZER_MODEL/$file" ]] || die "Missing tokenizer file: $TOKENIZER_MODEL/$file"
+    done
     [[ -f "$DATA_PATH.bin" && -f "$DATA_PATH.idx" ]] || die "Missing DATA_PATH.bin or DATA_PATH.idx"
     if [[ "$DRY_RUN" != 1 ]]; then
         "$PYTHON_BIN" - "$TOKENIZER_MODEL" <<'PY'
 import sys
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained(sys.argv[1], local_files_only=True)
+tok = AutoTokenizer.from_pretrained(sys.argv[1], local_files_only=True, use_fast=True)
 assert len(tok) == 128256, f"Expected Llama vocabulary of 128256, got {len(tok)}"
 PY
     fi
@@ -137,6 +142,7 @@ MODEL_ARGS=(
 # trades additional calculation for lower memory use. Sequence parallelism
 # distributes activation work over TP ranks. The distributed optimizer shards
 # optimizer state across DP replicas (there is no DP sharding benefit at DP=1).
+# CPU offload and its required precision-aware optimizer match the 8-GPU script.
 PARALLEL_ARGS=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
@@ -152,6 +158,10 @@ TRAINING_ARGS=(
     --global-batch-size "$GLOBAL_BATCH_SIZE"
     --train-iters "$TRAIN_ITERS"
     --optimizer adam
+    --use-precision-aware-optimizer
+    --optimizer-cpu-offload
+    --optimizer-offload-fraction 1.0
+    --overlap-cpu-optimizer-d2h-h2d
     --lr "${LR:-1.5e-4}"
     --min-lr "${MIN_LR:-1.5e-5}"
     --lr-decay-style cosine
@@ -180,18 +190,28 @@ echo "Microbatches/step=$NUM_MICROBATCHES tokens/step=$((GLOBAL_BATCH_SIZE * SEQ
 echo "Rendezvous=$MASTER_ADDR:$MASTER_PORT output=$RUN_DIR mock_data=$MOCK_DATA"
 
 # 7. Generate a shared worker script with safely quoted argument arrays. PBS
-# runs this submission script only once, so MPI explicitly starts both agents.
+# runs this submission script only once, so pbsdsh explicitly starts both agents.
 # Do not use the PBS spool copy of $0 as the remote worker path.
 mkdir -p "$RUN_DIR"
 WORKER="$RUN_DIR/launch_node.sh"
 {
     printf '#!/bin/bash\nset -euo pipefail\n'
     printf 'cd %q\n' "$REPO_DIR"
-    printf 'echo "Launching node rank ${OMPI_COMM_WORLD_RANK:?} on $(hostname)"\n'
-    printf '%q -c %q\n' "$PYTHON_BIN" 'import torch; import transformer_engine.pytorch; assert torch.cuda.device_count() == 8, "Expected 8 visible GPUs per node"; assert torch.cuda.is_bf16_supported(), "BF16 is required"; print(torch.__version__)'
+    for name in PATH LD_LIBRARY_PATH PYTHONPATH OMP_NUM_THREADS CUDA_DEVICE_MAX_CONNECTIONS; do
+        printf 'export %s=%q\n' "$name" "${!name}"
+    done
+    # Preserve optional network/library settings from the working environment.
+    while IFS= read -r name; do
+        case "$name" in
+            NCCL_*|GLOO_*|UCX_*|NVTE_*|CUDA_HOME|VIRTUAL_ENV|CONDA_PREFIX)
+                printf 'export %s=%q\n' "$name" "${!name}" ;;
+        esac
+    done < <(compgen -e)
+    printf 'echo "Launching node rank ${PBS_NODENUM:?} on $(hostname)"\n'
+    printf '%q -c %q\n' "$PYTHON_BIN" 'import torch; import transformer_engine.pytorch; from packaging.version import Version; assert Version(torch.__version__.split("+")[0]) >= Version("2.3"), "CPU offload requires PyTorch >=2.3"; assert torch.cuda.device_count() == 8, "Expected 8 visible GPUs per node"; assert torch.cuda.is_bf16_supported(), "BF16 is required"; print(torch.__version__)'
     printf 'exec %q -m torch.distributed.run ' "$PYTHON_BIN"
     printf '%q ' --nnodes "$NUM_NODES" --nproc_per_node "$GPUS_PER_NODE" --master_addr "$MASTER_ADDR" --master_port "$MASTER_PORT" --max_restarts 0
-    printf '%s ' '--node_rank "${OMPI_COMM_WORLD_RANK:?}"'
+    printf '%s ' '--node_rank "${PBS_NODENUM:?}"'
     printf '%q ' "$REPO_DIR/pretrain_gpt.py" "${MODEL_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${TRAINING_ARGS[@]}" "${DATA_ARGS[@]}"
     if (( ${#CHECKPOINT_ARGS[@]} )); then printf '%q ' "${CHECKPOINT_ARGS[@]}"; fi
     printf '\n'
@@ -202,8 +222,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
     cat "$WORKER"
     exit 0
 fi
-command -v mpirun >/dev/null || die "Load ABCI HPC-X (module load hpcx/2.20) before submission"
-mpirun -np "$NUM_NODES" --map-by ppr:1:node --bind-to none \
-    --hostfile "$PBS_NODEFILE" \
-    -x PATH -x LD_LIBRARY_PATH -x OMP_NUM_THREADS -x CUDA_DEVICE_MAX_CONNECTIONS \
-    /bin/bash "$WORKER" 2>&1 | tee "$RUN_DIR/train.log"
+command -v pbsdsh >/dev/null || die "pbsdsh is required to start torch.distributed.run on both PBS nodes"
+# With mpiprocs=1, pbsdsh starts one concurrent agent per node. Do not use -s:
+# sequential launch would leave the first agent waiting for the second.
+pbsdsh /bin/bash "$WORKER" 2>&1 | tee "$RUN_DIR/train.log"
