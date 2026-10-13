@@ -6,6 +6,8 @@
 #PBS -P gai51741
 #PBS -j oe
 #PBS -V
+#PBS -koed
+#PBS -o output/
 
 # Random-initialized Llama 3.3 70B architecture; this does not load Meta weights.
 # Tested against the flags on the Megatron-LM-Edgar-abci branch.
@@ -16,6 +18,23 @@
 #            qsub examples/llama/edo_train_llama33_70b_h200.sh
 # Benchmark: qsub -v MOCK_DATA=1 examples/llama/edo_train_llama33_70b_h200.sh
 # 100 optimizer steps is a smoke/throughput run, not a complete pretraining recipe.
+
+python --version
+python -c "import torch; print(torch.__version__)"
+
+
+# Removing Checkpoint
+echo removing checkpoints/....
+rm -rf checkpoints/*
+
+# Removing tensor-records
+echo removing tensor-records/...
+rm -rf tensorboard/*
+
+# Removing chakras
+echo removing chakras/...
+rm -rf chakra/*
+
 
 set -euo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }

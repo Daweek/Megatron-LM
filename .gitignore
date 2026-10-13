@@ -31,4 +31,6 @@ checkpoints/
 tensorboard/
 chakra/
 profile/
+output/
+
 
